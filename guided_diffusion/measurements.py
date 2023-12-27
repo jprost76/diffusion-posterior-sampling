@@ -5,6 +5,7 @@ from functools import partial
 import yaml
 from torch.nn import functional as F
 from torchvision import torch
+from numpy import load as npload
 from motionblur.motionblur import Kernel
 
 from util.resizer import Resizer
@@ -86,6 +87,35 @@ class SuperResolutionOperator(LinearOperator):
     def project(self, data, measurement, **kwargs):
         return data - self.transpose(self.forward(data)) + self.transpose(measurement)
 
+@register_operator(name='super_resolution_blur')
+class SuperResolutionBlurOperator(LinearOperator):
+    def __init__(self, in_shape, scale_factor, kernel_path, device):
+        self.device = device
+        # blur
+        kernel = npload(kernel_path)
+        kernel = kernel/kernel.sum()
+        h, w = kernel.shape
+        if h != w:
+            raise ValueError('Expecting square kernel')
+        self.kernel = torch.from_numpy(kernel)
+        self.conv = Blurkernel(kernel_size=h, device=device).to(device)
+        self.conv.update_weights(self.kernel.type(torch.float32))
+        # resize
+        self.up_sample = partial(F.interpolate, scale_factor=scale_factor)
+        self.down_sample = Resizer(in_shape, 1/scale_factor).to(device)
+
+    def forward(self, data, **kwargs):
+        # blur + downsample
+        return self.down_sample(self.conv(data))
+
+    def transpose(self, data, **kwargs):
+        # upsample + blur transpose
+        return self.conv.forward_transpose(self.up_sample(data))
+
+    def project(self, data, measurement, **kwargs):
+        return data - self.transpose(self.forward(data)) + self.transpose(measurement)
+
+
 @register_operator(name='motion_blur')
 class MotionBlurOperator(LinearOperator):
     def __init__(self, kernel_size, intensity, device):
@@ -132,6 +162,31 @@ class GaussialBlurOperator(LinearOperator):
 
     def get_kernel(self):
         return self.kernel.view(1, 1, self.kernel_size, self.kernel_size)
+
+
+@register_operator(name='kernel_blur')
+class KernelBlurOperator(LinearOperator):
+    # load a kernel from a .npy file
+    def __init__(self, kernel_path, device):
+        self.device = device
+        kernel = npload(kernel_path)
+        kernel = kernel/kernel.sum()
+        h, w = kernel.shape
+        if h != w:
+            raise ValueError('Expecting square kernel')
+        self.kernel = torch.from_numpy(kernel)
+        self.conv = Blurkernel(kernel_size=h, device=device).to(device)
+        self.conv.update_weights(self.kernel.type(torch.float32))
+
+    def forward(self, data, **kwargs):
+        return self.conv(data)
+
+    def transpose(self, data, **kwargs):
+        return data #???
+
+    def get_kernel(self):
+        return self.kernel.view(1, 1, self.kernel_size, self.kernel_size)
+
 
 @register_operator(name='inpainting')
 class InpaintingOperator(LinearOperator):
