@@ -1,13 +1,14 @@
 import numpy as np
 import torch
 import scipy
+import math
 import torch.nn.functional as F
+import cv2
 from torch import nn
 from torch.autograd import Variable
 import matplotlib.pyplot as plt
 from motionblur.motionblur import Kernel
 from .fastmri_utils import fft2c_new, ifft2c_new
-
 
 """
 Helper functions for new types of inverse problems
@@ -176,19 +177,20 @@ def random_sq_bbox(img, mask_shape, image_size=256, margin=(16, 16)):
 
 class mask_generator:
     def __init__(self, mask_type, mask_len_range=None, mask_prob_range=None,
-                 image_size=256, margin=(16, 16)):
+                 image_size=256, margin=(16, 16), path=None):
         """
         (mask_len_range): given in (min, max) tuple.
         Specifies the range of box size in each dimension
         (mask_prob_range): for the case of random masking,
         specify the probability of individual pixels being masked
         """
-        assert mask_type in ['box', 'random', 'both', 'extreme']
+        assert mask_type in ['box', 'random', 'both', 'extreme', 'path']
         self.mask_type = mask_type
         self.mask_len_range = mask_len_range
         self.mask_prob_range = mask_prob_range
         self.image_size = image_size
         self.margin = margin
+        self.path = path
 
     def _retrieve_box(self, img):
         l, h = self.mask_len_range
@@ -215,6 +217,14 @@ class mask_generator:
         mask[:, ...] = mask_b
         return mask
 
+    def _retrieve_mask_from_path(self, img):
+        mask_np = np.load(self.path)
+        mask_b = torch.tensor(mask_np).unsqueeze(0)
+        mask = torch.ones_like(img, device=img.device)
+        mask[:, ...] = mask_b
+        return mask
+
+
     def __call__(self, img):
         if self.mask_type == 'random':
             mask = self._retrieve_random(img)
@@ -225,6 +235,9 @@ class mask_generator:
         elif self.mask_type == 'extreme':
             mask, t, th, w, wl = self._retrieve_box(img)
             mask = 1. - mask
+            return mask
+        elif self.mask_type == 'path':
+            mask = self._retrieve_mask_from_path(img)
             return mask
 
 def unnormalize(img, s=0.95):
@@ -269,11 +282,17 @@ class Blurkernel(nn.Module):
             nn.ReflectionPad2d(self.kernel_size//2),
             nn.Conv2d(3, 3, self.kernel_size, stride=1, padding=0, bias=False, groups=3)
         )
-
+        self.seq_t = nn.Sequential(
+            nn.ReflectionPad2d(self.kernel_size//2),
+            nn.Conv2d(3, 3, self.kernel_size, stride=1, padding=0, bias=False, groups=3)
+        )
         self.weights_init()
 
     def forward(self, x):
         return self.seq(x)
+
+    def forward_transpose(self, y):
+        return self.seq_t(y)
 
     def weights_init(self):
         if self.blur_type == "gaussian":
@@ -281,21 +300,25 @@ class Blurkernel(nn.Module):
             n[self.kernel_size // 2,self.kernel_size // 2] = 1
             k = scipy.ndimage.gaussian_filter(n, sigma=self.std)
             k = torch.from_numpy(k)
-            self.k = k
-            for name, f in self.named_parameters():
-                f.data.copy_(k)
         elif self.blur_type == "motion":
             k = Kernel(size=(self.kernel_size, self.kernel_size), intensity=self.std).kernelMatrix
             k = torch.from_numpy(k)
-            self.k = k
-            for name, f in self.named_parameters():
-                f.data.copy_(k)
+        self.k = k
+        kt = torch.flip(k, dims=(0, 1))
+        self.kt = kt
+        self.seq[1].weight.data.copy_(k)
+        self.seq_t[1].weight.data.copy_(kt)
+        # for name, f in self.named_parameters():
+            # f.data.copy_(k)
 
     def update_weights(self, k):
         if not torch.is_tensor(k):
             k = torch.from_numpy(k).to(self.device)
-        for name, f in self.named_parameters():
-            f.data.copy_(k)
+        kt = torch.flip(k, dims=(0, 1))
+        self.seq[1].weight.data.copy_(k)
+        self.seq_t[1].weight.data.copy_(kt)
+        # for name, f in self.named_parameters():
+        #     f.data.copy_(k)
 
     def get_kernel(self):
         return self.k
@@ -359,6 +382,80 @@ def total_variation_loss(img, weight):
     tv_h = ((img[:, :, 1:, :] - img[:, :, :-1, :]).pow(2)).mean()
     tv_w = ((img[:, :, :, 1:] - img[:, :, :, :-1]).pow(2)).mean()
     return weight * (tv_h + tv_w)
+
+
+# ----------
+# PSNR
+# ----------
+def calculate_psnr(img1, img2, border=0, imax=255):
+    img1 = img1 * 255/imax
+    img2 = img2 * 255/imax
+    # img1 and img2 have range [0, 255]
+    if not img1.shape == img2.shape:
+        raise ValueError('Input images must have the same dimensions.')
+    h, w = img1.shape[:2]
+    img1 = img1[border:h-border, border:w-border]
+    img2 = img2[border:h-border, border:w-border]
+
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    mse = np.mean((img1 - img2)**2)
+    if mse == 0:
+        return float('inf')
+    return 20 * math.log10(255.0 / math.sqrt(mse))
+
+
+# ----------
+# SSIM
+# ----------
+def calculate_ssim(img1, img2, border=0, imax=255):
+    '''calculate SSIM
+    the same outputs as MATLAB's
+    img1, img2: [0, 255]
+    '''
+    img1 = img1 * 255/imax
+    img2 = img2 * 255/imax
+    if not img1.shape == img2.shape:
+        raise ValueError('Input images must have the same dimensions.')
+    h, w = img1.shape[:2]
+    img1 = img1[border:h-border, border:w-border]
+    img2 = img2[border:h-border, border:w-border]
+
+    if img1.ndim == 2:
+        return ssim(img1, img2)
+    elif img1.ndim == 3:
+        if img1.shape[2] == 3:
+            ssims = []
+            for i in range(3):
+                ssims.append(ssim(img1, img2))
+            return np.array(ssims).mean()
+        elif img1.shape[2] == 1:
+            return ssim(np.squeeze(img1), np.squeeze(img2))
+    else:
+        raise ValueError('Wrong input image dimensions.')
+
+
+def ssim(img1, img2):
+    C1 = (0.01 * 255)**2
+    C2 = (0.03 * 255)**2
+
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    kernel = cv2.getGaussianKernel(11, 1.5)
+    window = np.outer(kernel, kernel.transpose())
+
+    mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]  # valid
+    mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
+    mu1_sq = mu1**2
+    mu2_sq = mu2**2
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = cv2.filter2D(img1**2, -1, window)[5:-5, 5:-5] - mu1_sq
+    sigma2_sq = cv2.filter2D(img2**2, -1, window)[5:-5, 5:-5] - mu2_sq
+    sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) *
+                                                            (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean()
 
 
 if __name__ == '__main__':

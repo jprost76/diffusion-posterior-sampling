@@ -12,7 +12,8 @@ from guided_diffusion.measurements import get_noise, get_operator
 from guided_diffusion.unet import create_model
 from guided_diffusion.gaussian_diffusion import create_sampler
 from data.dataloader import get_dataset, get_dataloader
-from util.img_utils import clear_color, mask_generator
+from util.img_utils import clear_color, mask_generator, calculate_psnr, calculate_ssim
+from util.utils_lpips import LPIPS_np
 from util.logger import get_logger
 
 
@@ -21,11 +22,18 @@ def load_yaml(file_path: str) -> dict:
         config = yaml.load(f, Loader=yaml.FullLoader)
     return config
 
+def pt2np(t):
+    return t.detach().cpu().squeeze().permute(1, 2, 0).numpy()
+
+def get_fname(filepath):
+    fname = os.path.split(filepath)[-1]
+    fname = os.path.splitext(fname)[0]
+    return fname
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_config', type=str)
-    parser.add_argument('--diffusion_config', type=str)
+    parser.add_argument('--model_config', type=str, default='configs/model_config.yaml')
+    parser.add_argument('--diffusion_config', type=str, default='configs/diffusion_config.yaml')
     parser.add_argument('--task_config', type=str)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./results')
@@ -34,6 +42,8 @@ def main():
     # logger
     logger = get_logger()
     
+    # lpips loss
+    calculate_lpips = LPIPS_np()
     # Device setting
     device_str = f"cuda:{args.gpu}" if torch.cuda.is_available() else 'cpu'
     logger.info(f"Device set to {device_str}.")
@@ -69,7 +79,12 @@ def main():
     sample_fn = partial(sampler.p_sample_loop, model=model, measurement_cond_fn=measurement_cond_fn)
    
     # Working directory
-    out_path = os.path.join(args.save_dir, measure_config['operator']['name'])
+    if measure_config['operator']['name'] == 'kernel_blur':
+        kname = get_fname(measure_config['operator']['kernel_path'])
+        sigma = measure_config['noise']['sigma']
+        out_path = os.path.join(args.save_dir, 'deblurring', f'k_{kname}', f'std_{sigma}')
+    else:
+        out_path = os.path.join(args.save_dir, measure_config['operator']['name'])
     os.makedirs(out_path, exist_ok=True)
     for img_dir in ['input', 'recon', 'progress', 'label']:
         os.makedirs(os.path.join(out_path, img_dir), exist_ok=True)
@@ -113,9 +128,21 @@ def main():
         x_start = torch.randn(ref_img.shape, device=device).requires_grad_()
         sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path)
 
+        # -> [0, 1]
+        sample = pt2np(sample) * 0.5 + 0.5
+        ref_img = pt2np(ref_img) * 0.5 + 0.5
+        # metrics
+        psnr = calculate_psnr(sample, ref_img, imax=1)
+        ssim = calculate_ssim(sample, ref_img, imax=1)
+        lpips = calculate_lpips(sample, ref_img)
+        logpath = os.path.join(out_path, 'logs.csv')
+        with open(logpath, 'a+') as f:
+            f.write(f'{i};{psnr:.3f};{ssim:.3f};{lpips:.3f};')
+            f.write('\n')
+        logger.info(f'{i}; PSNR:{psnr:.3f}; SSIM:{ssim:.3f};LPIPS:{lpips:.3f};')
         plt.imsave(os.path.join(out_path, 'input', fname), clear_color(y_n))
-        plt.imsave(os.path.join(out_path, 'label', fname), clear_color(ref_img))
-        plt.imsave(os.path.join(out_path, 'recon', fname), clear_color(sample))
+        plt.imsave(os.path.join(out_path, 'label', fname), ref_img.clip(0, 1))
+        plt.imsave(os.path.join(out_path, 'recon', fname), sample.clip(0, 1))
 
 if __name__ == '__main__':
     main()
